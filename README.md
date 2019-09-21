@@ -1,9 +1,17 @@
-# Reptile 2.0 (beta)
+# Reptile
 
 <img align="left" src="https://imgur.com/nqujOlz.png">
 
-<br><br><br><br><br>Reptile is a Linux LKM rootkit. **Beta version, be careful when using it.**
 <br><br><br><br><br>
+<br><br><br><br><br>
+
+## Tested on
+
+**Debian 9**: 4.9.0-8-amd64<br>
+**Ubuntu 18.04.1 LTS**: 4.15.0-38-generic<br>
+**Kali Linux**: 4.18.0-kali2-amd64<br>
+**Centos 7**: 3.10.0-862.3.2.el7.x86_64<br>
+**Centos 6.10**: 2.6.32-754.6.3.el6.x86_64
 
 ## Features
 
@@ -11,7 +19,7 @@
 - Hide files and directories
 - Hide processes
 - Hide himself
-- Hide TCP/IP connections
+- Hide TCP/UDP connections
 - Hidden boot persistence
 - File content tampering
 - Some obfuscation techniques
@@ -23,7 +31,6 @@
 ## Install
 ```
 apt-get install linux-headers-$(uname -r)
-perl -MCPAN -e "install String::Unescape"
 git clone https://github.com/f0rb1dd3n/Reptile.git
 cd Reptile
 ./setup.sh install
@@ -59,7 +66,6 @@ Special thanks to my friend [Ilya V. Matveychikov](https://github.com/milabs) fo
 
 If you wanna more information, send me an e-mail: f0rb1dd3n@tuta.io
 
-<br>
 <p align="center">
-   <img src="https://imgur.com/RdYgb1T.gif">
+   <img src="http://2.bp.blogspot.com/-OMozG1JNxic/VQxKMfiU2EI/AAAAAAAAOQM/_suBsIa9O7c/s1600/Reptile%2B6.gif">
 </p>
